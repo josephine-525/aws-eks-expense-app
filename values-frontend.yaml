@@ -1,0 +1,106 @@
+# team-payments-frontend — values for the common-web-service chart (helm-charts repo).
+# Old k8s/eks-workload.yaml (envsubst + argocd-application.yaml) is being retired in favor
+# of this file + the ApplicationSet, but is left in place, not deleted.
+
+image:
+  # Repo name confirmed live via `aws ecr describe-repositories` (no "-expense-", see backend's
+  # values.yaml comment). Tag is a manual push (manual-2 — see backend's values.yaml comment for
+  # why manual-1 didn't work) — switch to image-release-seq counter tags once CI is rewritten.
+  repository: "123456789012.dkr.ecr.ca-central-1.amazonaws.com/demoapp-frontend"
+  tag: "4c59c36a"
+
+replicaCount: 2  # HPA floor — must match autoscaling.minReplicas below
+
+service:
+  targetPort: 80
+  extraPorts:
+    - name: metrics
+      port: 9113
+      targetPort: 9113
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 20
+  failureThreshold: 3
+
+# nginx-prometheus-exporter sidecar: shares the pod's network namespace, so localhost
+# reaches the nginx container directly — no Service/DNS needed between the two.
+extraContainers:
+  - name: nginx-exporter
+    image: nginx/nginx-prometheus-exporter:1.3
+    args:
+      - --nginx.scrape-uri=http://localhost:80/nginx_status
+    ports:
+      - name: metrics
+        containerPort: 9113
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 50m
+        memory: 64Mi
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+# kube-prometheus-stack's Prometheus only watches ServiceMonitors carrying this exact
+# label (its own serviceMonitorSelector) — confirmed from the real project's code, not guessed.
+serviceMonitor:
+  enabled: true
+  port: metrics
+  labels:
+    release: kube-prometheus-stack
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: common-web-service
+              app.kubernetes.io/instance: team-payments-frontend
+          topologyKey: kubernetes.io/hostname
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: common-web-service
+        app.kubernetes.io/instance: team-payments-frontend
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: common-web-service
+        app.kubernetes.io/instance: team-payments-frontend

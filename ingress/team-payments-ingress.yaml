@@ -1,0 +1,54 @@
+# Standalone Ingress for team-payments, deliberately outside the common-web-service
+# chart (see helm-charts design notes) -- it spans both backend and frontend Services
+# under one ALB, and a generic single-release chart shouldn't need cross-release
+# knowledge of another release's Service name. Delivered by its own ArgoCD Application
+# (gitops/applications/team-payments-ingress.yaml), which reads this file directly.
+#
+# Security group ID is the real value from SSM /dev/compute/eks_alb_security_group_id,
+# resolved once and checked in here -- same pattern as the real values already baked
+# into expenseapp/values-backend.yaml (ECR account ID, IRSA role ARN). This never went
+# through envsubst/CI templating the way the old k8s/eks-workload.yaml Ingress did.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: team-payments
+  namespace: team-payments
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/security-groups: sg-0cdd2a8a825cba795
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /expenses
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /months
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /summary
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-frontend-common-web-service
+                port:
+                  number: 80

@@ -1,0 +1,165 @@
+# expenseapp — build+push (shared template) + self-managed deploy for terraform-live/dev.
+#
+# Rewritten 2026-09-21 (again, same day) to split out shared vs. self-owned logic:
+# - build-backend/build-frontend now `include` ci-templates//build-push.yml instead of
+#   hand-rolling the docker build/tag/push logic — that part is genuinely reusable by
+#   any future buildable app (a Kafka consumer, most likely), this repo just supplies
+#   its own Dockerfile paths/ECR repo names/build-args.
+# - Platform bootstrap (LBC/metrics-server/ArgoCD installs, the 5 ArgoCD repo-creds
+#   Secrets, applying gitops's own Application/ApplicationSet files) moved OUT
+#   entirely, to the `gitops` repo's own pipeline. That's cluster-lifecycle work, not
+#   per-app work, and doesn't belong in any one app's CI. Run it separately, once per
+#   fresh cluster, BEFORE this pipeline: infra apply -> gitops bootstrap pipeline ->
+#   this pipeline.
+# - What stays here, self-owned: this repo's own values-backend.yaml/values-frontend.yaml
+#   (image tag), its own ingress/team-payments-ingress.yaml (SG ID sync), and waiting
+#   for its own Applications/ALB to come up. None of that is generic enough to share.
+#
+# Manual trigger only (GitLab -> CI/CD -> Pipelines -> "Run pipeline"), not on every
+# push -- this deploys to a real cluster.
+#
+# Image tag = $CI_COMMIT_SHORT_SHA (no image-release-seq SSM counter -- doesn't exist
+# in terraform-live, never recreated, a commit-SHA tag needs no extra state).
+#
+# Required CI/CD variables:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (masked) -- this
+#     identity must already have an EKS access entry (EKS_CI_PRINCIPAL_ARN passed to
+#     expenseinfra's dev/compute apply).
+#   GITOPS_PUSH_TOKEN (masked, write_repository, scoped to this project) -- pushes the
+#     image-tag/SG-ID bump commit.
+#
+# ECR repo names (demoapp-backend/-frontend) and the EKS cluster name
+# (demoapp-dev-expense-eks) are hardcoded rather than derived from one shared
+# prefix -- conflating those two was a real bug (see expenseinfra/README.md's
+# troubleshooting log).
+
+include:
+  - project: 'demo-org/ci-templates'
+    ref: v1.0.0
+    file: '/build-push.yml'
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+stages:
+  - build
+  - deploy
+
+variables:
+  ECR_BACKEND_REPO: demoapp-backend
+  ECR_FRONTEND_REPO: demoapp-frontend
+  EKS_CLUSTER_NAME: demoapp-dev-expense-eks
+
+.default-branch-rule: &default_branch_rule
+  if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+build-backend:
+  extends: .build_push_image
+  stage: build
+  rules:
+    - *default_branch_rule
+  variables:
+    DOCKERFILE_PATH: backend/Dockerfile
+    BUILD_CONTEXT: backend
+    ECR_REPO: demoapp-backend
+
+build-frontend:
+  extends: .build_push_image
+  stage: build
+  rules:
+    - *default_branch_rule
+  variables:
+    DOCKERFILE_PATH: frontend/Dockerfile
+    BUILD_CONTEXT: frontend
+    ECR_REPO: demoapp-frontend
+    EXTRA_BUILD_ARGS: "--build-arg API_BASE= --build-arg EKS_PROXY=1"
+
+deploy-values:
+  image: alpine:3.20
+  stage: deploy
+  rules:
+    - *default_branch_rule
+  needs:
+    - job: build-backend
+    - job: build-frontend
+  before_script:
+    - apk add --no-cache aws-cli kubectl git
+    - |
+      if [ -z "${GITOPS_PUSH_TOKEN:-}" ]; then
+        echo "Set CI/CD variable GITOPS_PUSH_TOKEN (masked, write_repository, scoped to this project)." >&2; exit 1
+      fi
+      echo "=== caller identity ===" && aws sts get-caller-identity
+      aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      echo "=== kubectl auth check (expects the gitops bootstrap pipeline to have already run) ===" && kubectl auth can-i get pods -n team-payments || true
+  script:
+    - |
+      # ── Bump this repo's own values files + Ingress SG annotation, then push ────
+      # This IS the deploy: expense-teams.yaml's ApplicationSet (applied by the
+      # gitops repo's own pipeline, not this one) reads the two values files from
+      # git, so pushing the new tag is what makes ArgoCD roll out the new image.
+      #
+      # The ALB security group ID is NOT a stable value across environment rebuilds
+      # (unlike the ECR account ID / IRSA role ARN already baked into the values
+      # files) -- it's a freshly-generated AWS resource ID every time dev/compute
+      # gets destroyed and reapplied. Real incident, 2026-09-21: a hardcoded SG ID
+      # from a previous rebuild went stale, LBC failed with "InvalidGroup.NotFound",
+      # and the Ingress sat at HEALTH=Progressing with no ALB ever created. Reading
+      # it fresh from SSM on every deploy instead of trusting whatever's committed
+      # closes this for good.
+      git config user.email "gitlab-ci@expenseapp.local"
+      git config user.name "GitLab CI"
+      git fetch origin "${CI_DEFAULT_BRANCH}"
+      git checkout -B "${CI_DEFAULT_BRANCH}" "origin/${CI_DEFAULT_BRANCH}"
+      sed -i "s#^  tag: .*#  tag: \"${CI_COMMIT_SHORT_SHA}\"#" values-backend.yaml values-frontend.yaml
+      ALB_SG_ID=$(aws ssm get-parameter --name /dev/compute/eks_alb_security_group_id \
+        --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)
+      sed -i "s#^    alb.ingress.kubernetes.io/security-groups: .*#    alb.ingress.kubernetes.io/security-groups: ${ALB_SG_ID}#" ingress/team-payments-ingress.yaml
+      git add values-backend.yaml values-frontend.yaml ingress/team-payments-ingress.yaml
+      if git diff --cached --quiet; then
+        echo "No changes to commit."
+      else
+        git commit -m "deploy: ${CI_COMMIT_SHORT_SHA} to eks"
+        git push "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+      fi
+      kubectl -n argocd annotate application team-payments-ingress argocd.argoproj.io/refresh=hard --overwrite || true
+    - |
+      # ── Wait for the team-payments Applications to sync ─────────────────────────
+      echo "Waiting for ArgoCD to sync team-payments Applications..."
+      for app in team-payments-backend team-payments-frontend; do
+        i=0
+        while [ "$i" -lt 36 ]; do
+          SYNC=$(kubectl -n argocd get application "$app" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+          HEALTH=$(kubectl -n argocd get application "$app" -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+          echo "$app: sync=${SYNC:-<none>} health=${HEALTH:-<none>}"
+          if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then break; fi
+          i=$((i + 1)); sleep 5
+        done
+        if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ]; then
+          echo "ERROR: $app did not reach Synced+Healthy within 3 minutes." >&2
+          kubectl -n argocd get application "$app" -o yaml || true
+          exit 1
+        fi
+      done
+    - kubectl rollout status deployment/team-payments-backend-common-web-service -n team-payments --timeout=300s
+    - kubectl rollout status deployment/team-payments-frontend-common-web-service -n team-payments --timeout=300s
+    - |
+      echo "Waiting for the team-payments ALB hostname..."
+      i=0
+      while [ "$i" -lt 36 ]; do
+        HOST=$(kubectl get ingress team-payments -n team-payments -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        if [ -n "$HOST" ]; then echo "ALB hostname: $HOST"; break; fi
+        i=$((i + 1)); sleep 10
+      done
+      if [ -z "${HOST:-}" ]; then
+        echo "WARNING: no ALB hostname yet after 6 minutes -- check separately, not failing the pipeline for this." >&2
+      fi
+    - |
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "App: http://${HOST:-<pending>}"
+      echo "Grafana (port-forward only): kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3001:80"
+      echo "ArgoCD (port-forward only):  kubectl -n argocd port-forward svc/argocd-server 8081:443"
+      echo "  password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,0 +1,153 @@
+# Dashboard-as-code: the grafana_dashboard=1 label is what the kube-prometheus-stack
+# Grafana sidecar watches for — it loads/updates this dashboard automatically, same
+# mechanism the bundled "Kubernetes / ..." dashboards use. Apply directly with
+# `kubectl apply -f` (no envsubst — the ${datasource} below is a Grafana template
+# variable, not a shell variable).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: expense-app-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  expense-app.json: |
+    {
+      "uid": "expense-app-overview",
+      "title": "Expense App",
+      "tags": ["expense"],
+      "timezone": "",
+      "schemaVersion": 39,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "label": "Data source",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "default", "value": "default", "selected": true },
+            "hide": 0,
+            "regex": ""
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "CPU usage (cores)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"team-payments\", container!=\"\", container!=\"POD\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Memory working set",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"team-payments\", container!=\"\", container!=\"POD\"}) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Container restarts (last 1h)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"team-payments\"}[1h])) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Network I/O",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(container_network_receive_bytes_total{namespace=\"team-payments\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}} rx"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(container_network_transmit_bytes_total{namespace=\"team-payments\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}} tx"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Pods available",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(kube_deployment_status_replicas_available{namespace=\"team-payments\"}) by (deployment)",
+              "legendFormat": "{{deployment}}"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "title": "Nginx frontend requests/sec",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(nginx_http_requests_total{namespace=\"team-payments\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "title": "HPA CPU utilization vs target",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "kube_horizontalpodautoscaler_status_target_metric{namespace=\"team-payments\", metric_target_type=\"utilization\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} current"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "kube_horizontalpodautoscaler_spec_target_metric{namespace=\"team-payments\", metric_target_type=\"utilization\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} target"
+            }
+          ]
+        }
+      ]
+    }

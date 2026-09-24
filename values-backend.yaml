@@ -1,0 +1,93 @@
+# team-payments-backend — values for the common-web-service chart (helm-charts repo).
+# Old k8s/eks-workload.yaml (envsubst + argocd-application.yaml) is being retired in favor
+# of this file + the ApplicationSet, but is left in place, not deleted.
+
+image:
+  # Repo name confirmed live via `aws ecr describe-repositories` (terraform-modules/ecr names
+  # it "${name_prefix}-backend", no "-expense-" — the old expenseinfra/terraform layer used to
+  # have "-expense-" in the name, this is not that). Tag is a manual push (manual-2 — manual-1
+  # was arm64-only, built without --platform linux/amd64 on Apple Silicon, and ErrImagePull'd on
+  # the amd64 EKS nodes); once CI is rewritten to match this environment, switch back to the
+  # image-release-seq counter tags.
+  repository: "123456789012.dkr.ecr.ca-central-1.amazonaws.com/demoapp-backend"
+  tag: "4c59c36a"
+
+replicaCount: 2  # HPA floor — must match autoscaling.minReplicas below
+
+service:
+  targetPort: 8080
+
+env:
+  - name: TABLE_NAME
+    value: demoapp-dev-expenses
+  - name: AWS_DEFAULT_REGION
+    value: ca-central-1
+  - name: AWS_REGION
+    value: ca-central-1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  failureThreshold: 3
+
+serviceAccount:
+  create: true
+  annotations:
+    # Read live from SSM /dev/compute/eks_expense_backend_role_arn.
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/demoapp-dev-eks-expense-backend-sa"
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: common-web-service
+              app.kubernetes.io/instance: team-payments-backend
+          topologyKey: kubernetes.io/hostname
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: common-web-service
+        app.kubernetes.io/instance: team-payments-backend
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: common-web-service
+        app.kubernetes.io/instance: team-payments-backend
