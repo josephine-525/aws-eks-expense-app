@@ -1,0 +1,57 @@
+# Alerting-as-code: pairs with the ServiceMonitor in eks-workload.yaml (which says
+# *what* to scrape) — this says *when the scraped data means something's wrong*.
+# Same gotcha as ServiceMonitor: kube-prometheus-stack's Prometheus only evaluates
+# PrometheusRules carrying this release label (its ruleSelector) — without it, the
+# rules exist in the cluster but Prometheus never loads them, no error shown.
+# No envsubst needed — every value here is a literal, not a CI-supplied secret/tag,
+# so this file is copied into k8s/rendered/ as-is, same as the Grafana dashboard.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: expense-app-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: expense-app
+      rules:
+        - alert: ExpenseAppPodRestartingTooOften
+          # rate() over 15m rather than a raw increase() threshold: catches a pod
+          # stuck in a slow crash loop just as well as a fast one, without needing
+          # to guess an absolute restart count.
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="expense"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.pod }} is restarting too often"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} has restarted more than 3 times in the last 15 minutes."
+
+        - alert: ExpenseAppDeploymentReplicasUnavailable
+          # Compares available vs. desired replicas directly, rather than alerting on
+          # "< 3" — this way the threshold doesn't need updating if replicas ever changes.
+          expr: |
+            kube_deployment_status_replicas_available{namespace="expense"}
+              < kube_deployment_spec_replicas{namespace="expense"}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.deployment }} has fewer available replicas than desired"
+            description: "Deployment {{ $labels.deployment }} has been under its desired replica count for over 10 minutes — check `kubectl get pods` and recent events."
+
+        - alert: ExpenseAppContainerMemoryNearLimit
+          # container!="" / !="POD" excludes the pause container's own cgroup rows,
+          # same filter the dashboard panels already use for CPU/memory.
+          expr: |
+            (container_memory_working_set_bytes{namespace="expense", container!="", container!="POD"}
+              / on(pod, container) kube_pod_container_resource_limits{namespace="expense", resource="memory"})
+              > 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is near its memory limit"
+            description: "Memory working set has been above 90% of the configured limit for over 10 minutes — risk of OOMKill."

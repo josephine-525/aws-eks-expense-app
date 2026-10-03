@@ -1,0 +1,157 @@
+# expenseapp — build+push (shared template) + deploy (shared template) for terraform-live/dev.
+#
+# Rewritten 2026-09-27 to pull the generic deploy logic (bump tag in values
+# file(s), commit/push, wait for ArgoCD sync, kubectl rollout status) out
+# into ci-templates//deploy-values.yml's .deploy_values -- the same move
+# already made for build (.build_push_image). This repo now keeps ONLY what's
+# genuinely its own: bumping values-backend.yaml/values-frontend.yaml
+# together, syncing the ALB security-group annotation, and waiting for its
+# own ALB hostname. See ci-templates/deploy-values.yml for the generic part
+# and why it's split this way (idp-cli's generated services use the exact
+# same template).
+#
+# - build-backend/build-frontend `include` ci-templates//build-push.yml --
+#   genuinely reusable by any future buildable app, this repo just supplies
+#   its own Dockerfile paths/ECR repo names/build-args.
+# - Platform bootstrap (LBC/metrics-server/ArgoCD installs, the 5 ArgoCD repo-creds
+#   Secrets, applying gitops's own Application/ApplicationSet files) moved OUT
+#   entirely, to the `gitops` repo's own pipeline. That's cluster-lifecycle work, not
+#   per-app work, and doesn't belong in any one app's CI. Run it separately, once per
+#   fresh cluster, BEFORE this pipeline: infra apply -> gitops bootstrap pipeline ->
+#   this pipeline.
+# - What stays here, self-owned: this repo's own values-backend.yaml/values-frontend.yaml
+#   (image tag, via the shared deploy template), its own ingress/team-payments-ingress.yaml
+#   (SG ID sync, NOT generic -- only this repo has an Ingress/ALB), and waiting
+#   for its own ALB to come up.
+#
+# Manual trigger only (GitLab -> CI/CD -> Pipelines -> "Run pipeline"), not on every
+# push -- this deploys to a real cluster.
+#
+# Image tag = $CI_COMMIT_SHORT_SHA (no image-release-seq SSM counter -- doesn't exist
+# in terraform-live, never recreated, a commit-SHA tag needs no extra state).
+#
+# Required CI/CD variables:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (masked) -- this
+#     identity must already have an EKS access entry (EKS_CI_PRINCIPAL_ARN passed to
+#     expenseinfra's dev/compute apply).
+#   GITOPS_PUSH_TOKEN (masked, write_repository, scoped to this project) -- pushes the
+#     image-tag/SG-ID bump commits.
+#
+# ECR repo names (demoapp-backend/-frontend) and the EKS cluster name
+# (demoapp-dev-expense-eks) are hardcoded rather than derived from one shared
+# prefix -- conflating those two was a real bug (see expenseinfra/README.md's
+# troubleshooting log).
+
+include:
+  - project: 'demo-org/ci-templates'
+    ref: v1.1.0
+    file:
+      - '/build-push.yml'
+      - '/deploy-values.yml'
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+stages:
+  - build
+  - deploy
+
+variables:
+  ECR_BACKEND_REPO: demoapp-backend
+  ECR_FRONTEND_REPO: demoapp-frontend
+  EKS_CLUSTER_NAME: demoapp-dev-expense-eks
+
+.default-branch-rule: &default_branch_rule
+  if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+build-backend:
+  extends: .build_push_image
+  stage: build
+  rules:
+    - *default_branch_rule
+  variables:
+    DOCKERFILE_PATH: backend/Dockerfile
+    BUILD_CONTEXT: backend
+    ECR_REPO: demoapp-backend
+
+build-frontend:
+  extends: .build_push_image
+  stage: build
+  rules:
+    - *default_branch_rule
+  variables:
+    DOCKERFILE_PATH: frontend/Dockerfile
+    BUILD_CONTEXT: frontend
+    ECR_REPO: demoapp-frontend
+    EXTRA_BUILD_ARGS: "--build-arg API_BASE= --build-arg EKS_PROXY=1"
+
+deploy-values:
+  extends: .deploy_values
+  stage: deploy
+  rules:
+    - *default_branch_rule
+  needs:
+    - job: build-backend
+    - job: build-frontend
+  variables:
+    VALUES_FILE: "values-backend.yaml values-frontend.yaml"
+    ARGOCD_APP: "team-payments-backend team-payments-frontend"
+    DEPLOYMENT_NAME: "team-payments-backend-common-web-service team-payments-frontend-common-web-service"
+    K8S_NAMESPACE: team-payments
+  before_script:
+    - !reference [.deploy_values, before_script]
+    - |
+      echo "=== kubectl auth check (expects the gitops bootstrap pipeline to have already run) ===" && kubectl auth can-i get pods -n team-payments || true
+  script:
+    - |
+      # ── team-payments-specific: sync the ALB security-group ID into the Ingress ──
+      # This is a SEPARATE commit from the shared template's tag bump below (was one
+      # combined commit before this refactor) -- functionally equivalent, ArgoCD
+      # picks up both either way; splitting it out is the cost of sharing the generic
+      # bump+push+wait+rollout logic via .deploy_values.
+      #
+      # The ALB security group ID is NOT a stable value across environment rebuilds
+      # (unlike the ECR account ID / IRSA role ARN already baked into the values
+      # files) -- it's a freshly-generated AWS resource ID every time dev/compute
+      # gets destroyed and reapplied. Real incident, 2026-09-21: a hardcoded SG ID
+      # from a previous rebuild went stale, LBC failed with "InvalidGroup.NotFound",
+      # and the Ingress sat at HEALTH=Progressing with no ALB ever created. Reading
+      # it fresh from SSM on every deploy instead of trusting whatever's committed
+      # closes this for good.
+      git config user.email "gitlab-ci@expenseapp.local"
+      git config user.name "GitLab CI"
+      git fetch origin "${CI_DEFAULT_BRANCH}"
+      git checkout -B "${CI_DEFAULT_BRANCH}" "origin/${CI_DEFAULT_BRANCH}"
+      ALB_SG_ID=$(aws ssm get-parameter --name /dev/compute/eks_alb_security_group_id \
+        --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)
+      sed -i "s#^    alb.ingress.kubernetes.io/security-groups: .*#    alb.ingress.kubernetes.io/security-groups: ${ALB_SG_ID}#" ingress/team-payments-ingress.yaml
+      git add ingress/team-payments-ingress.yaml
+      if git diff --cached --quiet; then
+        echo "No SG change to commit."
+      else
+        git commit -m "deploy: sync ALB SG for ${CI_COMMIT_SHORT_SHA}"
+        git push "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+      fi
+    - !reference [.deploy_values, script]
+    - kubectl -n argocd annotate application team-payments-ingress argocd.argoproj.io/refresh=hard --overwrite || true
+    - |
+      echo "Waiting for the team-payments ALB hostname..."
+      i=0
+      while [ "$i" -lt 36 ]; do
+        HOST=$(kubectl get ingress team-payments -n team-payments -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        if [ -n "$HOST" ]; then echo "ALB hostname: $HOST"; break; fi
+        i=$((i + 1)); sleep 10
+      done
+      if [ -z "${HOST:-}" ]; then
+        echo "WARNING: no ALB hostname yet after 6 minutes -- check separately, not failing the pipeline for this." >&2
+      fi
+    - |
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "App: http://${HOST:-<pending>}"
+      echo "Grafana (port-forward only): kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3001:80"
+      echo "ArgoCD (port-forward only):  kubectl -n argocd port-forward svc/argocd-server 8081:443"
+      echo "  password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

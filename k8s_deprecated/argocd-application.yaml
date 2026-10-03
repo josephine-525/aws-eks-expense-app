@@ -1,0 +1,41 @@
+# ArgoCD watches k8s/rendered/ in THIS repo — CI no longer applies manifests directly.
+# CI renders eks-workload.yaml/eks-serviceaccount.yaml (envsubst) + copies the dashboard
+# ConfigMap into k8s/rendered/, commits, pushes; ArgoCD detects the git diff and syncs.
+# selfHeal: true means manual `kubectl apply`/`edit` against these resources gets
+# reverted back to whatever's in git — that's the point of GitOps, but worth knowing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: expenseapp
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ${CI_PROJECT_URL}.git
+    targetRevision: ${CI_DEFAULT_BRANCH}
+    path: k8s/rendered
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: expense
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+  # Without this, ArgoCD and the HPAs in eks-workload.yaml fight: HPA scales
+  # spec.replicas away from the git-declared value (2), selfHeal sees that as
+  # drift from git and forces it back to 2, undoing the scale-up every sync.
+  # This tells ArgoCD "don't diff spec.replicas on these two Deployments —
+  # the HPA owns that field, not git."
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: expense-backend
+      jsonPointers:
+        - /spec/replicas
+    - group: apps
+      kind: Deployment
+      name: expense-frontend
+      jsonPointers:
+        - /spec/replicas

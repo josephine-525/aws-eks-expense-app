@@ -1,0 +1,74 @@
+# Standalone Ingress for team-payments, deliberately outside the common-web-service
+# chart (see helm-charts design notes) -- it spans both backend and frontend Services
+# under one ALB, and a generic single-release chart shouldn't need cross-release
+# knowledge of another release's Service name. Delivered by its own ArgoCD Application
+# (gitops/applications/team-payments-ingress.yaml), which reads this file directly.
+#
+# Security group ID is normally the real value read from SSM
+# /dev/compute/eks_alb_security_group_id, resolved once and checked into the
+# private repo this mirror is sanitized from (sg-0123456789abcdef0 below is a
+# placeholder for this public snapshot, not a real value). This never went
+# through envsubst/CI templating the way the old k8s/eks-workload.yaml Ingress did.
+#
+# The security-groups annotation above drifts on every cluster rebuild (new SG id) --
+# a GitLab CI deploy step ("sync ALB SG for <sha>") keeps it current automatically on
+# every deploy, so don't hand-edit that value here; it'll just get overwritten (correctly)
+# on the next pipeline run.
+#
+# /expenses, /months, /summary route straight to backend, same as before Istio existed.
+# Briefly rerouted through frontend on 2026-10-02 to work around Istio STRICT mTLS
+# rejecting ALB's plaintext calls -- reverted once team-payments' PeerAuthentication
+# moved to namespace-wide PERMISSIVE (gitops/istio/peer-authentication.yaml): the real
+# protection for the sensitive cross-team call (backend's /expenses/flag) belongs at the
+# identity layer (AuthorizationPolicy, matched on mTLS-verified principals), not at the
+# transport layer -- PERMISSIVE still auto-upgrades real mesh-to-mesh calls to mTLS, it
+# just also accepts ALB's plaintext, which has no principal and so can't satisfy any
+# AuthorizationPolicy ALLOW rule anyway. Routing through frontend also hit an unexplained
+# "upstream connect error ... reset reason: connection termination" from frontend's own
+# inbound Envoy on this exact path (confirmed via frontend's own nginx access log: the
+# request never even reached nginx) -- reverting sidesteps that without needing to root-
+# cause it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: team-payments
+  namespace: team-payments
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/security-groups: sg-0123456789abcdef0
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /expenses
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /months
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /summary
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-backend-common-web-service
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: team-payments-frontend-common-web-service
+                port:
+                  number: 80
